@@ -19,7 +19,9 @@ local Config = {
     url_format = "https://github.com/%s.git",
     log = vim.fn.stdpath(vim.fn.has("nvim-0.8") == 1 and "log" or "cache") .. "/paq.log",
     lock = vim.fn.stdpath("data") .. "/paq-lock.json",
-    clone_args = { "--depth=1", "--recurse-submodules", "--shallow-submodules", "--no-single-branch" }
+    clone_args = { "--depth=1", "--recurse-submodules", "--shallow-submodules", "--no-single-branch" },
+    clone_upstream_args = { "--recurse-submodules", "--shallow-submodules" },
+    upstream_format = "git@github.com:nerdrew/%s.git",
 }
 
 ---@enum Messages
@@ -275,25 +277,63 @@ end
 ---@field pin boolean
 ---@field build string | function
 ---@field url string
+---@field upstream string
+
+local function setup_upstream(pkg, counter, cb)
+    local fresh = function()
+        -- TODO support pkg.branch
+        run("git", { "fresh", "--rebase-abort", "--force", "upstream" }, pkg.dir, function(ok)
+            counter(pkg.name, Messages.install, ok and "ok" or "err")
+            if ok then
+                cb()
+            end
+        end)
+    end
+    run("git", { "remote", "get-url", "upstream" }, pkg.dir, function(upstream_exists)
+        if upstream_exists then
+            fresh()
+        else
+            run("git", { "remote", "add", "upstream", pkg.upstream }, pkg.dir, function(ok)
+                if ok then
+                    fresh()
+                else
+                    counter(pkg.name, Messages.install, "err")
+                end
+            end)
+        end
+    end)
+end
 
 ---@param pkg Package
 ---@param counter function
 ---@param build_queue table
 local function clone(pkg, counter, build_queue)
-    local args = vim.list_extend({ "clone", pkg.url }, Config.clone_args)
+    local args
+    if pkg.upstream then
+        args = vim.list_extend({ "clone", pkg.url }, Config.clone_upstream_args)
+    else
+        args = vim.list_extend({ "clone", pkg.url }, Config.clone_args)
+    end
     if pkg.branch then
         vim.list_extend(args, { "-b", pkg.branch })
     end
     table.insert(args, pkg.dir)
     run("git", args, nil, function(ok)
-        if ok then
+        local cb = function()
             pkg.status = Status.CLONED
             lock_write()
             if pkg.build then
                 table.insert(build_queue, pkg)
             end
         end
-        counter(pkg.name, Messages.install, ok and "ok" or "err")
+        if ok then
+            if pkg.upstream then
+                setup_upstream(pkg, counter, cb)
+            else
+                cb()
+                counter(pkg.name, Messages.install, ok and "ok" or "err")
+            end
+        end
     end)
 end
 
@@ -302,7 +342,13 @@ end
 ---@param build_queue table
 local function pull(pkg, counter, build_queue)
     local prev_hash = Lock[pkg.name] and Lock[pkg.name].hash or pkg.hash
-    run("git", { "pull", "--recurse-submodules", "--update-shallow" }, pkg.dir, function(ok)
+    local args
+    if pkg.upstream then
+        args = { "fresh", "--rebase-abort", "--force", "upstream" }
+    else
+        args = { "pull", "--recurse-submodules", "--update-shallow" }
+    end
+    run("git", args, pkg.dir, function(ok)
         if not ok then
             counter(pkg.name, Messages.update, "err")
         else
@@ -330,6 +376,8 @@ local function clone_or_pull(pkg, counter, build_queue)
         pull(pkg, counter, build_queue)
     elseif Filter.to_install(pkg) then
         clone(pkg, counter, build_queue)
+    elseif pkg.pin then
+        counter(pkg.name, Messages.update, "nop")
     end
 end
 
@@ -400,9 +448,14 @@ local function register(pkg)
     if type(pkg) == "string" then
         pkg = { pkg }
     end
-    local url = pkg.url
-        or (pkg[1]:match("^https?://") and pkg[1])                      -- [1] is a URL
-        or string.format(Config.url_format, pkg[1])                     -- [1] is a repository name
+    local url
+    if pkg.upstream then
+        url = string.format(Config.upstream_format, pkg.upstream:gsub("%.git$", ""):match("/([%w-_.]+)$"))                     -- [1] is a repository name
+    else
+        url = pkg.url
+            or (pkg[1]:match("^https?://") and pkg[1])                      -- [1] is a URL
+            or string.format(Config.url_format, pkg[1])                     -- [1] is a repository name
+    end
     local name = pkg.as or url:gsub("%.git$", ""):match("/([%w-_.]+)$") -- Infer name from `url`
     if not name then
         return vim.notify(" Paq: Failed to parse " .. vim.inspect(pkg), vim.log.levels.ERROR)
@@ -418,6 +471,7 @@ local function register(pkg)
         pin = pkg.pin,
         build = pkg.build or pkg.run,
         url = url,
+        upstream = pkg.upstream,
     }
     if pkg.run then
         vim.deprecate("`run` option", "`build`", "3.0", "Paq", false)
