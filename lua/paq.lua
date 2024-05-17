@@ -19,8 +19,8 @@ local Config = {
     url_format = "https://github.com/%s.git",
     log = vim.fn.stdpath(vim.fn.has("nvim-0.8") == 1 and "log" or "cache") .. "/paq.log",
     lock = vim.fn.stdpath("data") .. "/paq-lock.json",
-    clone_args = { "--depth=1", "--recurse-submodules", "--shallow-submodules", "--no-single-branch" },
-    clone_upstream_args = { "--recurse-submodules", "--shallow-submodules" },
+    clone_args = { "--depth=1", "--recurse-submodules", "--no-single-branch" },
+    clone_upstream_args = { "--recurse-submodules" },
     upstream_format = "git@github.com:nerdrew/%s.git",
 }
 
@@ -111,23 +111,25 @@ end
 ---@param cb function
 ---@param print_stdout boolean?
 local function run(process, args, cwd, cb, print_stdout)
-    local log = uv.fs_open(Config.log, "a+", 0x1A4)
-    local stderr = uv.new_pipe(false)
-    stderr:open(log)
-    local handle, pid
-    handle, pid = uv.spawn(
-        process,
-        { args = args, cwd = cwd, stdio = { nil, print_stdout and stderr, stderr }, env = Env },
-        vim.schedule_wrap(function(code)
+    table.insert(args, 1, process)
+    -- vim.notify(vim.inspect(args))
+    vim.system(
+        args,
+        { cwd = cwd, env = Env, text = true, timeout = 30000 },
+        vim.schedule_wrap(function(sc)
+            local log = uv.fs_open(Config.log, "a+", 0x1A4)
+            uv.fs_write(log, sc.stderr, nil, nil)
+            if print_stdout then
+                vim.notify(sc.stdout)
+            end
             uv.fs_close(log)
-            stderr:close()
-            handle:close()
-            cb(code == 0)
+            cb(sc.code == 0)
+            if sc.code ~= 0 then
+                local s = "\n\n\n Paq: Failed to run %s (%s) code=%s signal=%d \n\n\n"
+                vim.notify(s:format(vim.inspect(args), cwd, sc.code, sc.signal))
+            end
         end)
     )
-    if not handle then
-        vim.notify(string.format(" Paq: Failed to spawn %s (%s)", process, pid))
-    end
 end
 
 ---Return an interator that walks `dir` in post-order.
@@ -191,7 +193,7 @@ end
 
 ---@param name string
 ---@param msg_op Messages
----@param result boolean
+---@param result string
 ---@param n integer
 ---@param total integer
 local function report(name, msg_op, result, n, total)
@@ -205,11 +207,25 @@ end
 ---Object to track result of operations (installs, updates, etc.)
 ---@param total integer
 ---@param callback function
-local function new_counter(total, callback)
+local function new_counter(pkgs, callback)
+    local total = #pkgs
+    local names = vim.iter(pkgs):map(function(pkg)
+        return pkg.name
+    end):totable()
     return coroutine.wrap(function()
         local c = { ok = 0, err = 0, nop = 0 }
         while c.ok + c.err + c.nop < total do
+            -- vim.notify(("waiting ok=%d err=%d nop=%d total=%d"):format(c.ok, c.err, c.nop, total))
             local name, msg_op, result = coroutine.yield(true)
+
+            names = vim.iter(names):filter(function(unseen_name)
+                return unseen_name ~= name
+            end):totable()
+
+            -- if #names < 10 then
+            --     vim.notify("waiting on: "..vim.inspect(names))
+            -- end
+
             c[result] = c[result] + 1
             if result ~= "nop" or Config.verbose then
                 report(name, msg_op, result, c.ok + c.nop, total)
@@ -333,6 +349,8 @@ local function clone(pkg, counter, build_queue)
                 cb()
                 counter(pkg.name, Messages.install, ok and "ok" or "err")
             end
+        else
+            counter(pkg.name, Messages.install, ok and "ok" or "err")
         end
     end)
 end
@@ -346,7 +364,7 @@ local function pull(pkg, counter, build_queue)
     if pkg.upstream then
         args = { "fresh", "--rebase-abort", "--force", "upstream" }
     else
-        args = { "pull", "--recurse-submodules", "--update-shallow" }
+        args = { "pull", "--recurse-submodules" }
     end
     run("git", args, pkg.dir, function(ok)
         if not ok then
@@ -378,6 +396,8 @@ local function clone_or_pull(pkg, counter, build_queue)
         clone(pkg, counter, build_queue)
     elseif pkg.pin then
         counter(pkg.name, Messages.update, "nop")
+    else
+        counter(pkg.name, { ok = "Unknown clone_or_pull status: "..vim.inspect(pkg) }, "ok")
     end
 end
 
@@ -393,21 +413,23 @@ local function move(src, dst)
 end
 
 ---@param pkg Package
-local function run_build(pkg)
+local function run_build(pkg, counter, _)
     local t = type(pkg.build)
     if t == "function" then
+        ---@diagnostic disable-next-line: param-type-mismatch
         local ok = pcall(pkg.build)
-        report(pkg.name, Messages.build, ok and "ok" or "err")
+        counter(pkg.name, Messages.build, ok and "ok" or "err")
     elseif t == "string" and pkg.build:sub(1, 1) == ":" then
+        ---@diagnostic disable-next-line: param-type-mismatch
         local ok = pcall(vim.cmd, pkg.build)
-        report(pkg.name, Messages.build, ok and "ok" or "err")
+        counter(pkg.name, Messages.build, ok and "ok" or "err")
     elseif t == "string" then
         local args = {}
         for word in pkg.build:gmatch("%S+") do
             table.insert(args, word)
         end
         run(table.remove(args, 1), args, pkg.dir, function(ok)
-            report(pkg.name, Messages.build, ok and "ok" or "err")
+            counter(pkg.name, Messages.build, ok and "ok" or "err")
         end)
     end
 end
@@ -523,7 +545,7 @@ local function exe_op(op, fn, pkgs, silent)
         vim.cmd("doautocmd User PaqDone" .. op:gsub("^%l", string.upper))
     end
 
-    local counter = new_counter(#pkgs, after)
+    local counter = new_counter(pkgs, after)
     counter() -- Initialize counter
 
     for _, pkg in pairs(pkgs) do
@@ -672,11 +694,12 @@ do
         nargs = 1,
         complete = function() return vim.tbl_keys(vim.tbl_map(function(pkg) return pkg.build end, Packages)) end,
     }
+    local no_op_counter = function(_, _, _) end
     vim.api.nvim_create_user_command("PaqSync", function() paq:sync() end, { bar = true })
-    vim.api.nvim_create_user_command("PaqBuild", function(a) run_build(Packages[a.args]) end, build_cmd_opts)
+    vim.api.nvim_create_user_command("PaqBuild", function(a) run_build(Packages[a.args], no_op_counter, {}) end, build_cmd_opts)
     vim.api.nvim_create_user_command("PaqRunHook", function(a)
         vim.deprecate("`PaqRunHook` command", "`PaqBuild`", "3.0", "Paq", false)
-        run_build(Packages[a.args])
+        run_build(Packages[a.args], no_op_counter, {})
     end, build_cmd_opts)
 end
 
