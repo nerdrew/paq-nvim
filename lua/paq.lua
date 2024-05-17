@@ -60,9 +60,10 @@ local Filter = {
 -- Copy environment variables once. Doing it for every process seems overkill.
 local Env = {}
 for var, val in pairs(uv.os_environ()) do
-    table.insert(Env, string.format("%s=%s", var, val))
+    Env[var] = val
 end
-table.insert(Env, "GIT_TERMINAL_PROMPT=0")
+Env["GIT_TERMINAL_PROMPT"] = "0"
+Env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes"
 
 -- }}}
 -- UTILS: {{{
@@ -105,16 +106,14 @@ local function get_git_hash(dir)
     return head_ref and first_line(dir .. "/.git/" .. head_ref:gsub("ref: ", ""))
 end
 
----@param process string
----@param args string[]
+---@param cmd string[]
 ---@param cwd string?
 ---@param cb function
 ---@param print_stdout boolean?
-local function run(process, args, cwd, cb, print_stdout)
-    table.insert(args, 1, process)
-    -- vim.notify(vim.inspect(args))
+local function run(cmd, cwd, cb, print_stdout)
+    -- vim.notify(vim.inspect(cmd))
     vim.system(
-        args,
+        cmd,
         { cwd = cwd, env = Env, text = true, timeout = 30000 },
         vim.schedule_wrap(function(sc)
             local log = uv.fs_open(Config.log, "a+", 0x1A4)
@@ -126,10 +125,15 @@ local function run(process, args, cwd, cb, print_stdout)
             cb(sc.code == 0)
             if sc.code ~= 0 then
                 local s = "\n\n\n Paq: Failed to run %s (%s) code=%s signal=%d \n\n\n"
-                vim.notify(s:format(vim.inspect(args), cwd, sc.code, sc.signal))
+                vim.notify(s:format(vim.inspect(cmd), cwd, sc.code, sc.signal))
             end
         end)
     )
+end
+
+local function git(args, cwd, cb, print_stdout)
+    table.insert(args, 1, "git")
+    run(args, cwd, cb, print_stdout)
 end
 
 ---Return an interator that walks `dir` in post-order.
@@ -298,18 +302,18 @@ end
 local function setup_upstream(pkg, counter, cb)
     local fresh = function()
         -- TODO support pkg.branch
-        run("git", { "fresh", "--rebase-abort", "--force", "upstream" }, pkg.dir, function(ok)
+        git({ "fresh", "--rebase-abort", "--force", "upstream" }, pkg.dir, function(ok)
             counter(pkg.name, Messages.install, ok and "ok" or "err")
             if ok then
                 cb()
             end
         end)
     end
-    run("git", { "remote", "get-url", "upstream" }, pkg.dir, function(upstream_exists)
+    git({ "remote", "get-url", "upstream" }, pkg.dir, function(upstream_exists)
         if upstream_exists then
             fresh()
         else
-            run("git", { "remote", "add", "upstream", pkg.upstream }, pkg.dir, function(ok)
+            git({ "remote", "add", "upstream", pkg.upstream }, pkg.dir, function(ok)
                 if ok then
                     fresh()
                 else
@@ -334,7 +338,7 @@ local function clone(pkg, counter, build_queue)
         vim.list_extend(args, { "-b", pkg.branch })
     end
     table.insert(args, pkg.dir)
-    run("git", args, nil, function(ok)
+    git(args, nil, function(ok)
         local cb = function()
             pkg.status = Status.CLONED
             lock_write()
@@ -366,7 +370,7 @@ local function pull(pkg, counter, build_queue)
     else
         args = { "pull", "--recurse-submodules" }
     end
-    run("git", args, pkg.dir, function(ok)
+    git(args, pkg.dir, function(ok)
         if not ok then
             counter(pkg.name, Messages.update, "err")
         else
@@ -428,7 +432,7 @@ local function run_build(pkg, counter, _)
         for word in pkg.build:gmatch("%S+") do
             table.insert(args, word)
         end
-        run(table.remove(args, 1), args, pkg.dir, function(ok)
+        run(args, pkg.dir, function(ok)
             counter(pkg.name, Messages.build, ok and "ok" or "err")
         end)
     end
@@ -445,7 +449,7 @@ local function reclone(pkg, counter, build_queue)
         vim.list_extend(args, { "-b", pkg.branch })
     end
     table.insert(args, pkg.dir)
-    run("git", args, nil, function(ok)
+    git(args, nil, function(ok)
         if ok then
             pkg.status = Status.INSTALLED
             pkg.hash = get_git_hash(pkg.dir)
