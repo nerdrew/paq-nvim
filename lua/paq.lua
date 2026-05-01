@@ -91,19 +91,94 @@ local function find_unlisted()
     return unlisted
 end
 
+---@param path Path
+---@return string?
+local function first_line(path)
+    local file = io.open(path)
+    if file then
+        local line = file:read()
+        file:close()
+        return line
+    end
+end
+
+---@param base Path
+---@param path Path
+---@return Path
+local function resolve_git_path(base, path)
+    if path:match("^/") or path:match("^%a:[/\\]") then
+        return path
+    end
+    return base .. "/" .. path
+end
+
 ---@param dir Path
----@return string
-local function get_git_hash(dir)
-    local first_line = function(path)
-        local file = io.open(path)
-        if file then
-            local line = file:read()
+---@return Path?
+local function get_git_dir(dir)
+    local git_dir = dir .. "/.git"
+    if first_line(git_dir .. "/HEAD") then
+        return git_dir
+    end
+
+    local git_file = first_line(git_dir)
+    local git_file_dir = git_file and git_file:match("^gitdir:%s*(.-)%s*$")
+    if not git_file_dir or git_file_dir == "" then
+        return
+    end
+    return resolve_git_path(dir, git_file_dir)
+end
+
+---@param git_dir Path
+---@return Path
+local function get_common_git_dir(git_dir)
+    local common_dir = first_line(git_dir .. "/commondir")
+    common_dir = common_dir and common_dir:match("^%s*(.-)%s*$")
+    if not common_dir or common_dir == "" then
+        return git_dir
+    end
+    return resolve_git_path(git_dir, common_dir)
+end
+
+---@param git_dir Path
+---@param ref string
+---@return string?
+local function get_packed_ref(git_dir, ref)
+    local file = io.open(git_dir .. "/packed-refs")
+    if not file then
+        return
+    end
+    for line in file:lines() do
+        local hash, packed_ref = line:match("^(%x+)%s+(.+)$")
+        if packed_ref == ref then
             file:close()
-            return line
+            return hash
         end
     end
-    local head_ref = first_line(dir .. "/.git/HEAD")
-    return head_ref and first_line(dir .. "/.git/" .. head_ref:gsub("ref: ", ""))
+    file:close()
+end
+
+---@param dir Path
+---@return string?
+local function get_git_hash(dir)
+    local git_dir = get_git_dir(dir)
+    local head = git_dir and first_line(git_dir .. "/HEAD")
+    if not head then
+        return
+    end
+    local detached_hash = head:match("^%x+$")
+    if detached_hash then
+        return detached_hash
+    end
+
+    local ref = head:match("^ref:%s+(.+)$")
+    if not ref then
+        return
+    end
+    local common_git_dir = get_common_git_dir(git_dir)
+    local hash = first_line(git_dir .. "/" .. ref) or first_line(common_git_dir .. "/" .. ref)
+    return (hash and hash:match("^%x+$"))
+        or get_packed_ref(git_dir, ref)
+        or get_packed_ref(common_git_dir, ref)
 end
 
 ---@param cmd string[]
@@ -293,7 +368,7 @@ end
 ---@field branch string
 ---@field dir string
 ---@field status Status
----@field hash string
+---@field hash string?
 ---@field pin boolean
 ---@field build string | function
 ---@field url string
@@ -375,8 +450,13 @@ local function pull(pkg, counter, build_queue)
             counter(pkg.name, Messages.update, "err")
         else
             local cur_hash = get_git_hash(pkg.dir)
-            if cur_hash ~= prev_hash then
-                log_update_changes(pkg, prev_hash, cur_hash)
+            if not cur_hash then
+                vim.notify(" Paq: Failed to read git hash for " .. pkg.name, vim.log.levels.ERROR)
+                counter(pkg.name, Messages.update, "err")
+            elseif cur_hash ~= prev_hash then
+                if prev_hash then
+                    log_update_changes(pkg, prev_hash, cur_hash)
+                end
                 pkg.status, pkg.hash = Status.UPDATED, cur_hash
                 lock_write()
                 counter(pkg.name, Messages.update, "ok")
