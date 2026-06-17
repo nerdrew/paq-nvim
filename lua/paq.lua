@@ -389,11 +389,17 @@ local function setup_upstream(pkg, counter, cb)
             fresh()
         else
             git({ "remote", "add", "upstream", pkg.upstream }, pkg.dir, function(ok)
-                if ok then
-                    fresh()
-                else
+                if not ok then
                     counter(pkg.name, Messages.install, "err")
+                    return
                 end
+                git({ "fetch", "--recurse-submodules", "--prune", "upstream" }, pkg.dir, function(fetched)
+                    if fetched then
+                        fresh()
+                    else
+                        counter(pkg.name, Messages.install, "err")
+                    end
+                end)
             end)
         end
     end)
