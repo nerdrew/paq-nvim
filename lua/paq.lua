@@ -185,7 +185,8 @@ end
 ---@param cwd string?
 ---@param cb function
 ---@param print_stdout boolean?
-local function run(cmd, cwd, cb, print_stdout)
+---@param suppress_failure boolean?
+local function run(cmd, cwd, cb, print_stdout, suppress_failure)
     -- vim.notify(vim.inspect(cmd))
     vim.system(
         cmd,
@@ -198,7 +199,7 @@ local function run(cmd, cwd, cb, print_stdout)
             end
             uv.fs_close(log)
             cb(sc.code == 0)
-            if sc.code ~= 0 then
+            if sc.code ~= 0 and not suppress_failure then
                 local s = "\n\n\n Paq: Failed to run %s (%s) code=%s signal=%d \n\n\n"
                 vim.notify(s:format(vim.inspect(cmd), cwd, sc.code, sc.signal))
             end
@@ -206,9 +207,9 @@ local function run(cmd, cwd, cb, print_stdout)
     )
 end
 
-local function git(args, cwd, cb, print_stdout)
+local function git(args, cwd, cb, print_stdout, suppress_failure)
     table.insert(args, 1, "git")
-    run(args, cwd, cb, print_stdout)
+    run(args, cwd, cb, print_stdout, suppress_failure)
 end
 
 ---Return an interator that walks `dir` in post-order.
@@ -378,11 +379,15 @@ local function setup_upstream(pkg, counter, cb)
     local fresh = function()
         -- TODO support pkg.branch
         git({ "fresh", "--rebase-abort", "--force", "upstream" }, pkg.dir, function(ok)
-            counter(pkg.name, Messages.install, ok and "ok" or "err")
-            if ok then
-                cb()
+            if not ok then
+                vim.notify(
+                    " Paq: Installed " .. pkg.name .. ", but failed to synchronize upstream",
+                    vim.log.levels.WARN
+                )
             end
-        end)
+            cb()
+            counter(pkg.name, Messages.install, "ok")
+        end, false, true)
     end
     git({ "remote", "get-url", "upstream" }, pkg.dir, function(upstream_exists)
         if upstream_exists then
